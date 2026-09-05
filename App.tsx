@@ -1,3 +1,4 @@
+import CryptoJS from 'crypto-js';
 import React, {useState, useEffect, useRef} from 'react';
 import {
   View,
@@ -131,7 +132,31 @@ async function saveContact(name: string) {
   }
 }
 
-// add username-lookup store
+// encryption helpers
+function encryptText(text: string, keyHex: string): string {
+  const key = CryptoJS.enc.Hex.parse(keyHex);
+  const iv = CryptoJS.lib.WordArray.random(16);
+  const encrypted = CryptoJS.AES.encrypt(text, key, {iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7});
+  return iv.toString(CryptoJS.enc.Hex) + ':' + encrypted.toString();
+}
+
+function decryptText(payload: string, keyHex: string): string {
+  const [ivHex, cipherText] = payload.split(':');
+  const key = CryptoJS.enc.Hex.parse(keyHex);
+  const iv = CryptoJS.enc.Hex.parse(ivHex);
+  const decrypted = CryptoJS.AES.decrypt(cipherText, key, {iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7});
+  return decrypted.toString(CryptoJS.enc.Utf8);
+}
+
+async function getKey(contact: string): Promise<string | null> {
+  return AsyncStorage.getItem(`aesKey_${contact}`);
+}
+
+async function saveKey(contact: string, key: string) {
+  await AsyncStorage.setItem(`aesKey_${contact}`, key);
+}
+
+// username-lookup store
 const USERNAMES_KEY = 'usernameMap';
 
 async function saveUsername(deviceName: string, realUsername: string) {
@@ -391,6 +416,7 @@ function ChatScreen({
   const [status, setStatus] = useState(`Looking for ${contact}...`);
   const socketRef = useRef<any>(null);
   const serverRef = useRef<any>(null);
+  const keyRef = useRef<string | null>(null);
   const flatListRef = useRef<any>(null);
   const storageKey = `chat_${contact}`;
   const [displayName, setDisplayName] = useState(contact);
@@ -425,15 +451,16 @@ function ChatScreen({
   };
 
   const flushQueue = () => {
+    if (!keyRef.current) return;
     setMessages(prev => {
       const updated = prev.map(m => {
-        if (m.mine && m.status === 'pending' && socketRef.current) {
+        if (m.mine && m.status === 'pending' && socketRef.current && keyRef.current) {
           try {
             const packet: Packet = {
               messageId: m.id,
               senderId: 'my-device',
               recipientId: contact,
-              text: m.text,
+              text: encryptText(m.text, keyRef.current),
               ttl: 20,
               visitedNodes: ['my-device'],
               timestamp: Date.now(),
@@ -457,20 +484,37 @@ function ChatScreen({
     let pollTimer: any;
     let discoverTimer: any;
 
-    const attachSocket = (socket: any) => {
+    const attachSocket = async (socket: any, amOwner: boolean) => {
       socketRef.current = socket;
       setStatus('Connected ✅');
-      socket.write(JSON.stringify({type: 'hello', from: myUsername}) + '\n');
-      flushQueue();
-      socket.on('data', (data: any) => {
+
+      let keyHex = await getKey(contact);
+      if (amOwner && !keyHex) {
+        keyHex = CryptoJS.lib.WordArray.random(32).toString(CryptoJS.enc.Hex);
+        await saveKey(contact, keyHex);
+      }
+      keyRef.current = keyHex;
+
+      socket.write(JSON.stringify({type: 'hello', from: myUsername, key: amOwner ? keyHex : undefined}) + '\n');
+      if (keyRef.current) flushQueue();
+
+      socket.on('data', async (data: any) => {
         try {
           const parsed: any = JSON.parse(data.toString().trim());
           if (parsed.type === 'hello') {
             saveUsername(contact, parsed.from);
             setDisplayName(parsed.from);
+            if (parsed.key && !keyRef.current) {
+              keyRef.current = parsed.key;
+              await saveKey(contact, parsed.key);
+              flushQueue();
+            }
             return;
           }
-          if (parsed.text) addMessage(parsed.text, false);
+          if (parsed.text) {
+            const plain = keyRef.current ? decryptText(parsed.text, keyRef.current) : parsed.text;
+            addMessage(plain, false);
+          }
         } catch {
           addMessage(data.toString().trim(), false);
         }
@@ -484,7 +528,7 @@ function ChatScreen({
 
     const openAsServer = () => {
       if (serverRef.current) return;
-      const server = TcpSocket.createServer((socket: any) => attachSocket(socket));
+      const server = TcpSocket.createServer((socket: any) => attachSocket(socket, true));
       server.listen({port: 8888, host: '0.0.0.0'});
       serverRef.current = server;
     };
@@ -496,7 +540,7 @@ function ChatScreen({
         attempts++;
         const socket = TcpSocket.createConnection(
           {port: 8888, host: ip, timeout: 5000},
-          () => attachSocket(socket),
+          () => attachSocket(socket, false),
         );
         socket.on('error', (e: any) => {
           if (!cancelled && attempts < 5) setTimeout(tryConnect, 2000);
@@ -572,18 +616,18 @@ function ChatScreen({
   const sendMessage = () => {
     if (!input.trim()) return;
     const text = input.trim();
-    const packet: Packet = {
-      messageId: Date.now().toString(),
-      senderId: 'my-device',
-      recipientId: contact,
-      text,
-      ttl: 20,
-      visitedNodes: ['my-device'],
-      timestamp: Date.now(),
-    };
 
-    if (socketRef.current) {
+    if (socketRef.current && keyRef.current) {
       try {
+        const packet: Packet = {
+          messageId: Date.now().toString(),
+          senderId: 'my-device',
+          recipientId: contact,
+          text: encryptText(text, keyRef.current),
+          ttl: 20,
+          visitedNodes: ['my-device'],
+          timestamp: Date.now(),
+        };
         socketRef.current.write(JSON.stringify(packet) + '\n');
         addMessage(text, true, 'sent');
       } catch (e) {

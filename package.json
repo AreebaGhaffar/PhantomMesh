@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "^1.21.0",
+    "crypto-js": "^4.2.0",
     "react": "18.3.1",
     "react-native": "0.76.9",
     "react-native-tcp-socket": "^6.4.1",
@@ -27,6 +28,7 @@
     "@react-native/eslint-config": "0.76.9",
     "@react-native/metro-config": "0.76.9",
     "@react-native/typescript-config": "0.76.9",
+    "@types/crypto-js": "^4.2.2",
     "@types/react": "^18.2.6",
     "@types/react-test-renderer": "^18.0.0",
     "babel-jest": "^29.6.3",
