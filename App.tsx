@@ -203,15 +203,15 @@ function ContactsScreen({
 }) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [scanning, setScanning] = useState(false);
-  const [connecting, setConnecting] = useState('');
-  const [incomingRequest, setIncomingRequest] = useState<ConnectionRequest | null>(null);
   const pollRef = useRef<any>(null);
+  const discoverRef = useRef<any>(null);
   const connectionCheckRef = useRef<any>(null);
 
   useEffect(() => {
     initWifi();
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      if (discoverRef.current) clearInterval(discoverRef.current);
       if (connectionCheckRef.current) clearInterval(connectionCheckRef.current);
     };
   }, []);
@@ -225,28 +225,19 @@ function ContactsScreen({
       }
       await initialize();
       setTimeout(() => startScan(), 1500);
-      // Start listening for incoming connections
       startListeningForConnections();
     } catch (error) {
       console.log('WiFi init error:', error);
     }
   };
 
-  // Poll connection info to detect incoming connection requests
+  // Silently note a passive connection — no popup. ChatScreen handles the real link.
   const startListeningForConnections = () => {
     connectionCheckRef.current = setInterval(async () => {
       try {
         const info = await getConnectionInfo();
-        // If someone connected to us and we didn't initiate
-        if (info?.groupOwnerAddress && connecting === '') {
-          const ip = info.groupOwnerAddress?.hostAddress || '';
-          const isOwner = info.isGroupOwner;
+        if (info?.groupOwnerAddress) {
           console.log('Passive connection detected:', JSON.stringify(info));
-          // Show incoming request popup
-          setIncomingRequest({
-            deviceName: 'Nearby Device',
-            deviceAddress: ip,
-          });
           clearInterval(connectionCheckRef.current);
         }
       } catch (e) {}
@@ -256,6 +247,7 @@ function ContactsScreen({
   const startScan = async () => {
     try {
       if (pollRef.current) clearInterval(pollRef.current);
+      if (discoverRef.current) clearInterval(discoverRef.current);
       setScanning(true);
       setDevices([]);
 
@@ -269,13 +261,18 @@ function ContactsScreen({
         return;
       }
 
+      // Android's native discovery window is short-lived — keep re-triggering it
+      discoverRef.current = setInterval(() => {
+        startDiscoveringPeers().catch((e: any) => console.log('Re-discover error:', e));
+      }, 10000);
+
       let attempts = 0;
       pollRef.current = setInterval(async () => {
         attempts++;
         try {
           const result = await getAvailablePeers();
           console.log(`Poll ${attempts}: found ${result.devices?.length || 0} peers`);
-          if (result.devices && result.devices.length > 0) {
+          if (result.devices) {
             const mapped = result.devices.map((d: any) => ({
               id: d.deviceAddress,
               name: d.deviceName || `Device ${d.deviceAddress.slice(-6)}`,
@@ -284,119 +281,34 @@ function ContactsScreen({
               signal: 'Direct',
             }));
             setDevices(mapped);
-            setScanning(false);
-            clearInterval(pollRef.current);
           }
         } catch (e) {
           console.log('Poll error:', e);
         }
-        if (attempts >= 10) {
+        if (attempts >= 20) {
           clearInterval(pollRef.current);
+          clearInterval(discoverRef.current);
           setScanning(false);
         }
       }, 3000);
     } catch (error: any) {
       console.log('Scan error:', error);
-      Alert.alert('Scan Error', error?.message || JSON.stringify(error));
       setScanning(false);
     }
   };
 
-  const connectToDevice = async (device: Device) => {
-    try {
-      setConnecting(device.id);
-
-      await connectWithConfig({
-        deviceAddress: device.address,
-        groupOwnerIntent: 0, // Let the other device be group owner (server)
-      });
-
-      // Poll for connection info
-      let info = null;
-      for (let i = 0; i < 15; i++) {
-        await new Promise(r => setTimeout(r, 1000));
-        try {
-          info = await getConnectionInfo();
-          if (info?.groupOwnerAddress?.hostAddress) break;
-        } catch (e) {}
-      }
-
-      if (!info?.groupOwnerAddress?.hostAddress) {
-        Alert.alert('Connection Failed', 'Could not establish connection. Make sure the other phone accepts the request.');
-        setConnecting('');
-        return;
-      }
-
-      console.log('Connected! Info:', JSON.stringify(info));
-      const isOwner = info.isGroupOwner;
-      const ownerIP = info.groupOwnerAddress?.hostAddress || '';
-
-      await saveContact(device.name);
-      // Navigate to chat
-      onChat(device.name, isOwner ? 'SERVER' : ownerIP, isOwner);
-    } catch (error: any) {
-      Alert.alert('Connection Failed', error?.message || 'Try again.');
-      console.log('Connect error:', error);
-    } finally {
-      setConnecting('');
-    }
-  };
-
-  const openExistingChat = (device: Device) => {
-    // Open chat with stored messages — no connection needed
+  const openExistingChat = async (device: Device) => {
+    // Save as a known contact, open the chat immediately.
+    // No connect step here — ChatScreen finds and links to them silently in the background.
+    await saveContact(device.name);
     onChat(device.name, '', false);
-  };
-
-  const acceptIncomingRequest = async () => {
-    if (!incomingRequest) return;
-    setIncomingRequest(null);
-    try {
-      let info = null;
-      for (let i = 0; i < 10; i++) {
-        await new Promise(r => setTimeout(r, 1000));
-        try {
-          info = await getConnectionInfo();
-          if (info?.groupOwnerAddress?.hostAddress) break;
-        } catch (e) {}
-      }
-      const isOwner = info?.isGroupOwner || false;
-      const ownerIP = info?.groupOwnerAddress?.hostAddress || '';
-      await saveContact(incomingRequest.deviceName);
-      onChat(incomingRequest.deviceName, isOwner ? 'SERVER' : ownerIP, isOwner);
-    } catch (e) {
-      console.log('Accept error:', e);
-    }
   };
 
   return (
     <View style={styles.container}>
-      {/* Incoming Request Modal */}
-      <Modal visible={!!incomingRequest} transparent animationType="slide">
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>📲 Incoming Request</Text>
-            <Text style={styles.modalText}>
-              {incomingRequest?.deviceName} wants to connect
-            </Text>
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                style={[styles.modalBtn, {backgroundColor: '#FF4444'}]}
-                onPress={() => setIncomingRequest(null)}>
-                <Text style={styles.modalBtnText}>Decline</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.modalBtn, {backgroundColor: '#00D4FF'}]}
-                onPress={acceptIncomingRequest}>
-                <Text style={[styles.modalBtnText, {color: '#000'}]}>Accept</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
-
       <Text style={styles.screenTitle}>📡 Nearby Devices</Text>
       <Text style={styles.subtitle}>
-        {scanning ? 'Scanning... (up to 30s)' : `${devices.length} devices found`}
+        {scanning ? 'Scanning... (keeps looking)' : `${devices.length} devices found`}
       </Text>
       <TouchableOpacity style={styles.scanBtn} onPress={startScan}>
         <Text style={styles.scanText}>
@@ -415,27 +327,13 @@ function ContactsScreen({
         keyExtractor={item => item.id}
         style={{width: '100%', marginTop: 10}}
         renderItem={({item}) => (
-          <View style={styles.deviceCard}>
+          <TouchableOpacity style={styles.deviceCard} onPress={() => openExistingChat(item)}>
             <View style={{flex: 1}}>
               <Text style={styles.deviceName}>{item.name}</Text>
               <Text style={styles.deviceInfo}>{item.hops} hop • {item.signal}</Text>
             </View>
-            {/* Chat button — opens old msgs without connecting */}
-            <TouchableOpacity
-              style={styles.chatIconBtn}
-              onPress={() => openExistingChat(item)}>
-              <Text style={styles.chatIconText}>💬</Text>
-            </TouchableOpacity>
-            {/* Connect button */}
-            <TouchableOpacity
-              style={styles.connectBtn}
-              onPress={() => connectToDevice(item)}
-              disabled={connecting === item.id}>
-              <Text style={styles.connectBtnText}>
-                {connecting === item.id ? '...' : 'Connect'}
-              </Text>
-            </TouchableOpacity>
-          </View>
+            <Text style={styles.chatIconText}>💬</Text>
+          </TouchableOpacity>
         )}
       />
 
@@ -461,19 +359,17 @@ function ChatScreen({
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
-  const [status, setStatus] = useState('');
+  const [status, setStatus] = useState(`Looking for ${contact}...`);
   const socketRef = useRef<any>(null);
   const serverRef = useRef<any>(null);
   const flatListRef = useRef<any>(null);
   const storageKey = `chat_${contact}`;
-  const isConnected = peerIP !== '';
 
   const getTime = () => {
     const now = new Date();
     return now.getHours() + ':' + String(now.getMinutes()).padStart(2, '0');
   };
 
-  // Load saved messages
   useEffect(() => {
     AsyncStorage.getItem(storageKey).then(saved => {
       if (saved) {
@@ -496,63 +392,139 @@ function ChatScreen({
     setTimeout(() => flatListRef.current?.scrollToEnd(), 100);
   };
 
-  // Setup TCP connection only if we have an IP
-  useEffect(() => {
-    if (!isConnected) {
-      setStatus('Not connected — tap Connect to send messages');
-      return;
-    }
-
-    if (isServer) {
-      setStatus('Waiting for peer to connect...');
-      const server = TcpSocket.createServer(socket => {
-        socketRef.current = socket;
-        setStatus('Connected ✅');
-        socket.on('data', (data: any) => {
+  const flushQueue = () => {
+    setMessages(prev => {
+      const updated = prev.map(m => {
+        if (m.mine && m.status === 'pending' && socketRef.current) {
           try {
-            const packet: Packet = JSON.parse(data.toString().trim());
-            if (packet.text) addMessage(packet.text, false);
-          } catch {
-            addMessage(data.toString().trim(), false);
+            const packet: Packet = {
+              messageId: m.id,
+              senderId: 'my-device',
+              recipientId: contact,
+              text: m.text,
+              ttl: 20,
+              visitedNodes: ['my-device'],
+              timestamp: Date.now(),
+            };
+            socketRef.current.write(JSON.stringify(packet) + '\n');
+            return {...m, status: 'sent' as const};
+          } catch (e) {
+            return m;
           }
-        });
-        socket.on('error', (e: any) => {
-          console.log('Socket error:', e);
-          setStatus('Disconnected ❌');
-        });
-        socket.on('close', () => setStatus('Peer disconnected'));
+        }
+        return m;
       });
+      AsyncStorage.setItem(storageKey, JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  // Silently find, connect to, and link up with this contact — no buttons, no popups
+  useEffect(() => {
+    let cancelled = false;
+    let pollTimer: any;
+    let discoverTimer: any;
+
+    const attachSocket = (socket: any) => {
+      socketRef.current = socket;
+      setStatus('Connected ✅');
+      flushQueue();
+      socket.on('data', (data: any) => {
+        try {
+          const packet: Packet = JSON.parse(data.toString().trim());
+          if (packet.text) addMessage(packet.text, false);
+        } catch {
+          addMessage(data.toString().trim(), false);
+        }
+      });
+      socket.on('error', (e: any) => {
+        console.log('Socket error:', e);
+        setStatus('Disconnected');
+      });
+      socket.on('close', () => setStatus('Disconnected'));
+    };
+
+    const openAsServer = () => {
+      if (serverRef.current) return;
+      const server = TcpSocket.createServer((socket: any) => attachSocket(socket));
       server.listen({port: 8888, host: '0.0.0.0'});
       serverRef.current = server;
-    } else {
-      setStatus('Connecting to ' + peerIP + '...');
+    };
+
+    const openAsClient = (ip: string) => {
       let attempts = 0;
       const tryConnect = () => {
+        if (cancelled) return;
         attempts++;
-        console.log(`TCP attempt ${attempts} → ${peerIP}:8888`);
         const socket = TcpSocket.createConnection(
-          {port: 8888, host: peerIP, timeout: 5000},
-          () => setStatus('Connected ✅'),
+          {port: 8888, host: ip, timeout: 5000},
+          () => attachSocket(socket),
         );
-        socket.on('data', (data: any) => {
-          try {
-            const packet: Packet = JSON.parse(data.toString().trim());
-            if (packet.text) addMessage(packet.text, false);
-          } catch {
-            addMessage(data.toString().trim(), false);
-          }
-        });
         socket.on('error', (e: any) => {
-          console.log(`TCP error ${attempts}:`, e);
-          if (attempts < 5) setTimeout(tryConnect, 2000);
-          else setStatus('Connection failed ❌');
+          if (!cancelled && attempts < 5) setTimeout(tryConnect, 2000);
         });
-        socketRef.current = socket;
       };
-      setTimeout(tryConnect, 1500);
-    }
+      tryConnect();
+    };
+
+    const checkAlreadyConnected = async () => {
+      try {
+        const info = await getConnectionInfo();
+        if (info?.groupOwnerAddress?.hostAddress) {
+          if (info.isGroupOwner) openAsServer();
+          else openAsClient(info.groupOwnerAddress.hostAddress);
+          return true;
+        }
+      } catch (e) {}
+      return false;
+    };
+
+    const trySilentConnect = async (deviceAddress: string) => {
+      try {
+        await connectWithConfig({deviceAddress, groupOwnerIntent: 0});
+        for (let i = 0; i < 15 && !cancelled; i++) {
+          await new Promise(r => setTimeout(r, 1000));
+          const connected = await checkAlreadyConnected();
+          if (connected) return;
+        }
+      } catch (e) {
+        console.log('Silent connect error:', e);
+      }
+    };
+
+    const searchAndConnect = async () => {
+      const already = await checkAlreadyConnected();
+      if (already || cancelled) return;
+
+      setStatus(`Looking for ${contact}...`);
+      try {
+        await startDiscoveringPeers();
+      } catch (e) {}
+
+      pollTimer = setInterval(async () => {
+        if (cancelled) return;
+        try {
+          const result = await getAvailablePeers();
+          const match = result.devices?.find((d: any) => d.deviceName === contact);
+          if (match) {
+            clearInterval(pollTimer);
+            setStatus(`Connecting to ${contact}...`);
+            await trySilentConnect(match.deviceAddress);
+          }
+        } catch (e) {}
+      }, 3000);
+
+      discoverTimer = setInterval(() => {
+        startDiscoveringPeers().catch(() => {});
+      }, 12000);
+    };
+
+    searchAndConnect();
 
     return () => {
+      cancelled = true;
+      clearInterval(pollTimer);
+      clearInterval(discoverTimer);
       socketRef.current?.destroy();
       serverRef.current?.close();
     };
@@ -576,10 +548,10 @@ function ChatScreen({
         socketRef.current.write(JSON.stringify(packet) + '\n');
         addMessage(text, true, 'sent');
       } catch (e) {
-        addMessage(text, true, 'pending'); // socket existed but write failed — queue it
+        addMessage(text, true, 'pending');
       }
     } else {
-      addMessage(text, true, 'pending'); // not connected — queue it, no alert
+      addMessage(text, true, 'pending');
     }
     setInput('');
   };
@@ -588,10 +560,10 @@ function ChatScreen({
     <View style={{flex: 1, backgroundColor: '#0D0D1A'}}>
       <Text style={[styles.screenTitle, {marginTop: 10}]}>{contact}</Text>
       <Text style={styles.subtitle}>{status}</Text>
-      {!isConnected && (
+      {status !== 'Connected ✅' && (
         <View style={styles.offlineBanner}>
           <Text style={styles.offlineBannerText}>
-            📖 Viewing chat history — go back and tap Connect to send messages
+            📡 Not connected yet — your messages will send once {contact} is in range
           </Text>
         </View>
       )}
@@ -600,9 +572,7 @@ function ChatScreen({
         data={messages}
         keyExtractor={item => item.id}
         style={{flex: 1, marginTop: 10}}
-        ListEmptyComponent={
-          <Text style={styles.noDevices}>No messages yet</Text>
-        }
+        ListEmptyComponent={<Text style={styles.noDevices}>No messages yet</Text>}
         renderItem={({item}) => (
           <View style={[styles.bubble, item.mine ? styles.myBubble : styles.theirBubble]}>
             <Text style={styles.msgText}>{item.text}</Text>
