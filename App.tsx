@@ -49,6 +49,7 @@ interface Message {
   text: string;
   mine: boolean;
   time: string;
+  status: 'pending' | 'sent';   // NEW
 }
 
 interface ConnectionRequest {
@@ -75,6 +76,56 @@ async function requestPermissions() {
   } catch (e) {
     console.log('Permission error:', e);
     return false;
+  }
+}
+
+//  ChatListScreen
+function ChatsListScreen({onChat}: {onChat: (name: string) => void}) {
+  const [contacts, setContacts] = useState<{name: string; lastConnected: number}[]>([]);
+
+  useEffect(() => {
+    AsyncStorage.getItem(CONTACTS_KEY).then(raw => {
+      if (raw) setContacts(JSON.parse(raw));
+    });
+  }, []);
+
+  return (
+    <View style={styles.container}>
+      <Text style={styles.screenTitle}>💬 Chats</Text>
+      {contacts.length === 0 && (
+        <Text style={styles.noDevices}>
+          No chats yet.{'\n'}Go to Scan, connect with someone once, and they'll show up here.
+        </Text>
+      )}
+      <FlatList
+        data={contacts}
+        keyExtractor={item => item.name}
+        style={{width: '100%', marginTop: 10}}
+        renderItem={({item}) => (
+          <TouchableOpacity style={styles.deviceCard} onPress={() => onChat(item.name)}>
+            <View style={{flex: 1}}>
+              <Text style={styles.deviceName}>{item.name}</Text>
+              <Text style={styles.deviceInfo}>Tap to open chat</Text>
+            </View>
+          </TouchableOpacity>
+        )}
+      />
+    </View>
+  );
+}
+
+// Contact Store
+const CONTACTS_KEY = 'contactsList';
+
+async function saveContact(name: string) {
+  try {
+    const raw = await AsyncStorage.getItem(CONTACTS_KEY);
+    const list: {name: string; lastConnected: number}[] = raw ? JSON.parse(raw) : [];
+    const filtered = list.filter(c => c.name !== name);
+    filtered.unshift({name, lastConnected: Date.now()});
+    await AsyncStorage.setItem(CONTACTS_KEY, JSON.stringify(filtered));
+  } catch (e) {
+    console.log('saveContact error:', e);
   }
 }
 
@@ -113,7 +164,7 @@ function SetupScreen({onDone}: {onDone: (name: string) => void}) {
 
 // ─── Home Screen ──────────────────────────────────────────────────────────────
 
-function HomeScreen({onStart, onMap}: {onStart: () => void; onMap: () => void}) {
+function HomeScreen({onStart, onMap, onChats}: {onStart: () => void; onMap: () => void; onChats: () => void}) {
   return (
     <View style={styles.container}>
       <Text style={styles.logo}>👻</Text>
@@ -124,8 +175,13 @@ function HomeScreen({onStart, onMap}: {onStart: () => void; onMap: () => void}) 
       <View style={styles.badge}>
         <Text style={styles.badgeText}>📡 No Internet Needed</Text>
       </View>
-      <TouchableOpacity style={styles.button} onPress={onStart}>
-        <Text style={styles.buttonText}>Start Mesh Network</Text>
+      <TouchableOpacity style={styles.button} onPress={onChats}>
+        <Text style={styles.buttonText}>💬 Chats</Text>
+      </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.button, {backgroundColor: '#1A1A2E', marginTop: 12, borderWidth: 1, borderColor: '#00D4FF'}]}
+        onPress={onStart}>
+        <Text style={[styles.buttonText, {color: '#00D4FF'}]}>📡 Scan for Nearby</Text>
       </TouchableOpacity>
       <TouchableOpacity
         style={[styles.button, {backgroundColor: '#1A1A2E', marginTop: 12, borderWidth: 1, borderColor: '#00D4FF'}]}
@@ -275,6 +331,7 @@ function ContactsScreen({
       const isOwner = info.isGroupOwner;
       const ownerIP = info.groupOwnerAddress?.hostAddress || '';
 
+      await saveContact(device.name);
       // Navigate to chat
       onChat(device.name, isOwner ? 'SERVER' : ownerIP, isOwner);
     } catch (error: any) {
@@ -304,6 +361,7 @@ function ContactsScreen({
       }
       const isOwner = info?.isGroupOwner || false;
       const ownerIP = info?.groupOwnerAddress?.hostAddress || '';
+      await saveContact(incomingRequest.deviceName);
       onChat(incomingRequest.deviceName, isOwner ? 'SERVER' : ownerIP, isOwner);
     } catch (e) {
       console.log('Accept error:', e);
@@ -426,11 +484,11 @@ function ChatScreen({
     });
   }, []);
 
-  const addMessage = (text: string, mine: boolean) => {
+  const addMessage = (text: string, mine: boolean, status: 'pending' | 'sent' = 'sent') => {
     setMessages(prev => {
       const updated = [
         ...prev,
-        {id: Date.now().toString(), text, mine, time: getTime()},
+        {id: Date.now().toString(), text, mine, time: getTime(), status},
       ];
       AsyncStorage.setItem(storageKey, JSON.stringify(updated));
       return updated;
@@ -502,26 +560,28 @@ function ChatScreen({
 
   const sendMessage = () => {
     if (!input.trim()) return;
-    if (!socketRef.current) {
-      Alert.alert('Not Connected', 'Go back and tap Connect first.');
-      return;
-    }
+    const text = input.trim();
     const packet: Packet = {
       messageId: Date.now().toString(),
       senderId: 'my-device',
       recipientId: contact,
-      text: input.trim(),
+      text,
       ttl: 20,
       visitedNodes: ['my-device'],
       timestamp: Date.now(),
     };
-    try {
-      socketRef.current.write(JSON.stringify(packet) + '\n');
-      addMessage(input.trim(), true);
-      setInput('');
-    } catch (e) {
-      Alert.alert('Send Failed', 'Message could not be sent.');
+
+    if (socketRef.current) {
+      try {
+        socketRef.current.write(JSON.stringify(packet) + '\n');
+        addMessage(text, true, 'sent');
+      } catch (e) {
+        addMessage(text, true, 'pending'); // socket existed but write failed — queue it
+      }
+    } else {
+      addMessage(text, true, 'pending'); // not connected — queue it, no alert
     }
+    setInput('');
   };
 
   return (
@@ -546,23 +606,21 @@ function ChatScreen({
         renderItem={({item}) => (
           <View style={[styles.bubble, item.mine ? styles.myBubble : styles.theirBubble]}>
             <Text style={styles.msgText}>{item.text}</Text>
-            <Text style={styles.timeText}>{item.time}</Text>
+            <Text style={styles.timeText}>
+              {item.time} {item.mine && item.status === 'pending' ? '🕓' : ''}
+            </Text>
           </View>
         )}
       />
-      <View style={[styles.inputRow, !isConnected && {opacity: 0.5}]}>
+      <View style={styles.inputRow}>
         <TextInput
           style={styles.input}
           value={input}
           onChangeText={setInput}
-          placeholder={isConnected ? 'Message...' : 'Connect first to send...'}
+          placeholder="Message..."
           placeholderTextColor="#888"
-          editable={isConnected}
         />
-        <TouchableOpacity
-          style={[styles.sendBtn, !isConnected && {backgroundColor: '#444'}]}
-          onPress={sendMessage}
-          disabled={!isConnected}>
+        <TouchableOpacity style={styles.sendBtn} onPress={sendMessage}>
           <Text style={styles.sendText}>➤</Text>
         </TouchableOpacity>
       </View>
@@ -631,6 +689,7 @@ export default function App() {
   const [peerIP, setPeerIP] = useState('');
   const [isServer, setIsServer] = useState(false);
   const [username, setUsername] = useState('');
+  const [chatOrigin, setChatOrigin] = useState<'contacts' | 'chatslist'>('contacts');
 
   useEffect(() => {
     AsyncStorage.getItem('username').then(name => {
@@ -644,8 +703,9 @@ export default function App() {
   }, []);
 
   const goBack = () => {
-    if (screen === 'chat') setScreen('contacts');
+    if (screen === 'chat') setScreen(chatOrigin);
     else if (screen === 'map') setScreen('home');
+    else if (screen === 'chatslist') setScreen('home');
     else setScreen('home');
   };
 
@@ -666,7 +726,22 @@ export default function App() {
         <SetupScreen onDone={name => {setUsername(name); setScreen('home');}} />
       )}
       {screen === 'home' && (
-        <HomeScreen onStart={() => setScreen('contacts')} onMap={() => setScreen('map')} />
+        <HomeScreen
+          onStart={() => setScreen('contacts')}
+          onMap={() => setScreen('map')}
+          onChats={() => setScreen('chatslist')}
+        />
+      )}
+      {screen === 'chatslist' && (
+        <ChatsListScreen
+          onChat={name => {
+            setSelectedContact(name);
+            setPeerIP('');
+            setIsServer(false);
+            setChatOrigin('chatslist');
+            setScreen('chat');
+          }}
+        />
       )}
       {screen === 'contacts' && (
         <ContactsScreen
@@ -675,6 +750,7 @@ export default function App() {
             setSelectedContact(name);
             setPeerIP(ip);
             setIsServer(server);
+            setChatOrigin('contacts');
             setScreen('chat');
           }}
         />
