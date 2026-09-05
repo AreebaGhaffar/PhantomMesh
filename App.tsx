@@ -10,7 +10,6 @@ import {
   PermissionsAndroid,
   Alert,
   Platform,
-  Modal,
 } from 'react-native';
 
 import {
@@ -40,6 +39,7 @@ interface Packet {
 interface Device {
   id: string;
   name: string;
+  displayName?: string;
   address: string;
   hops: number;
   signal: string;
@@ -51,11 +51,6 @@ interface Message {
   mine: boolean;
   time: string;
   status: 'pending' | 'sent';   // NEW
-}
-
-interface ConnectionRequest {
-  deviceName: string;
-  deviceAddress: string;
 }
 
 // ─── Permissions ──────────────────────────────────────────────────────────────
@@ -82,11 +77,17 @@ async function requestPermissions() {
 
 //  ChatListScreen
 function ChatsListScreen({onChat}: {onChat: (name: string) => void}) {
-  const [contacts, setContacts] = useState<{name: string; lastConnected: number}[]>([]);
+  const [contacts, setContacts] = useState<{name: string; lastConnected: number; displayName?: string}[]>([]);
 
   useEffect(() => {
-    AsyncStorage.getItem(CONTACTS_KEY).then(raw => {
-      if (raw) setContacts(JSON.parse(raw));
+    AsyncStorage.getItem(CONTACTS_KEY).then(async raw => {
+      if (raw) {
+        const list = JSON.parse(raw);
+        const withNames = await Promise.all(
+          list.map(async (c: any) => ({...c, displayName: await getDisplayName(c.name)})),
+        );
+        setContacts(withNames);
+      }
     });
   }, []);
 
@@ -105,7 +106,7 @@ function ChatsListScreen({onChat}: {onChat: (name: string) => void}) {
         renderItem={({item}) => (
           <TouchableOpacity style={styles.deviceCard} onPress={() => onChat(item.name)}>
             <View style={{flex: 1}}>
-              <Text style={styles.deviceName}>{item.name}</Text>
+              <Text style={styles.deviceName}>{item.displayName}</Text>
               <Text style={styles.deviceInfo}>Tap to open chat</Text>
             </View>
           </TouchableOpacity>
@@ -127,6 +128,30 @@ async function saveContact(name: string) {
     await AsyncStorage.setItem(CONTACTS_KEY, JSON.stringify(filtered));
   } catch (e) {
     console.log('saveContact error:', e);
+  }
+}
+
+// add username-lookup store
+const USERNAMES_KEY = 'usernameMap';
+
+async function saveUsername(deviceName: string, realUsername: string) {
+  try {
+    const raw = await AsyncStorage.getItem(USERNAMES_KEY);
+    const map: Record<string, string> = raw ? JSON.parse(raw) : {};
+    map[deviceName] = realUsername;
+    await AsyncStorage.setItem(USERNAMES_KEY, JSON.stringify(map));
+  } catch (e) {
+    console.log('saveUsername error:', e);
+  }
+}
+
+async function getDisplayName(deviceName: string): Promise<string> {
+  try {
+    const raw = await AsyncStorage.getItem(USERNAMES_KEY);
+    const map: Record<string, string> = raw ? JSON.parse(raw) : {};
+    return map[deviceName] || deviceName;
+  } catch (e) {
+    return deviceName;
   }
 }
 
@@ -274,13 +299,14 @@ function ContactsScreen({
           const result = await getAvailablePeers();
           console.log(`Poll ${attempts}: found ${result.devices?.length || 0} peers`);
           if (result.devices) {
-            const mapped = result.devices.map((d: any) => ({
+            const mapped = await Promise.all(result.devices.map(async (d: any) => ({
               id: d.deviceAddress,
               name: d.deviceName || `Device ${d.deviceAddress.slice(-6)}`,
+              displayName: await getDisplayName(d.deviceName || d.deviceAddress),
               address: d.deviceAddress,
               hops: 1,
               signal: 'Direct',
-            }));
+            })));
             setDevices(mapped);
           }
         } catch (e) {
@@ -330,7 +356,7 @@ function ContactsScreen({
         renderItem={({item}) => (
           <TouchableOpacity style={styles.deviceCard} onPress={() => openExistingChat(item)}>
             <View style={{flex: 1}}>
-              <Text style={styles.deviceName}>{item.name}</Text>
+              <Text style={styles.deviceName}>{item.displayName}</Text>
               <Text style={styles.deviceInfo}>{item.hops} hop • {item.signal}</Text>
             </View>
             <Text style={styles.chatIconText}>💬</Text>
@@ -353,10 +379,12 @@ function ChatScreen({
   contact,
   peerIP,
   isServer,
+  myUsername,
 }: {
   contact: string;
   peerIP: string;
   isServer: boolean;
+  myUsername: string;
 }) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -365,7 +393,10 @@ function ChatScreen({
   const serverRef = useRef<any>(null);
   const flatListRef = useRef<any>(null);
   const storageKey = `chat_${contact}`;
-
+  const [displayName, setDisplayName] = useState(contact);
+  useEffect(() => {
+    getDisplayName(contact).then(setDisplayName);
+  }, []);
   const getTime = () => {
     const now = new Date();
     return now.getHours() + ':' + String(now.getMinutes()).padStart(2, '0');
@@ -429,11 +460,17 @@ function ChatScreen({
     const attachSocket = (socket: any) => {
       socketRef.current = socket;
       setStatus('Connected ✅');
+      socket.write(JSON.stringify({type: 'hello', from: myUsername}) + '\n');
       flushQueue();
       socket.on('data', (data: any) => {
         try {
-          const packet: Packet = JSON.parse(data.toString().trim());
-          if (packet.text) addMessage(packet.text, false);
+          const parsed: any = JSON.parse(data.toString().trim());
+          if (parsed.type === 'hello') {
+            saveUsername(contact, parsed.from);
+            setDisplayName(parsed.from);
+            return;
+          }
+          if (parsed.text) addMessage(parsed.text, false);
         } catch {
           addMessage(data.toString().trim(), false);
         }
@@ -560,7 +597,7 @@ function ChatScreen({
 
   return (
     <View style={{flex: 1, backgroundColor: '#0D0D1A'}}>
-      <Text style={[styles.screenTitle, {marginTop: 10}]}>{contact}</Text>
+      <Text style={[styles.screenTitle, {marginTop: 10}]}>{displayName}</Text>
       <Text style={styles.subtitle}>{status}</Text>
       {status !== 'Connected ✅' && (
         <View style={styles.offlineBanner}>
@@ -728,7 +765,7 @@ export default function App() {
         />
       )}
       {screen === 'chat' && (
-        <ChatScreen contact={selectedContact} peerIP={peerIP} isServer={isServer} />
+        <ChatScreen contact={selectedContact} peerIP={peerIP} isServer={isServer} myUsername={username} />
       )}
       {screen === 'map' && <NetworkMapScreen />}
     </View>
@@ -810,12 +847,4 @@ const styles = StyleSheet.create({
   sendText: {color: '#000', fontSize: 18, fontWeight: 'bold'},
   offlineBanner: {backgroundColor: '#1A1A00', padding: 10, marginHorizontal: 16, borderRadius: 8, marginTop: 8},
   offlineBannerText: {color: '#FFD700', fontSize: 12, textAlign: 'center'},
-  // Modal styles
-  modalOverlay: {flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'center', alignItems: 'center'},
-  modalBox: {backgroundColor: '#1A1A2E', borderRadius: 16, padding: 24, width: '80%', borderWidth: 1, borderColor: '#00D4FF'},
-  modalTitle: {color: '#FFF', fontSize: 20, fontWeight: 'bold', textAlign: 'center'},
-  modalText: {color: '#888', fontSize: 14, textAlign: 'center', marginTop: 10, marginBottom: 20},
-  modalButtons: {flexDirection: 'row', justifyContent: 'space-between', gap: 12},
-  modalBtn: {flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center'},
-  modalBtnText: {color: '#FFF', fontSize: 15, fontWeight: 'bold'},
 });
