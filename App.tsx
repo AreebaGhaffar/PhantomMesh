@@ -19,6 +19,7 @@ import {
   getAvailablePeers,
   connectWithConfig,
   getConnectionInfo,
+  removeGroup,
 } from 'rn-wifi-p2p';
 
 import TcpSocket from 'react-native-tcp-socket';
@@ -527,6 +528,7 @@ function ChatScreen({
       clearInterval(discoverTimer);
       socketRef.current?.destroy();
       serverRef.current?.close();
+      removeGroup().catch(() => {});
     };
   }, []);
 
