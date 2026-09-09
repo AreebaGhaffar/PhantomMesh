@@ -484,20 +484,12 @@ function ChatScreen({
     let pollTimer: any;
     let discoverTimer: any;
 
-    const attachSocket = async (socket: any, amOwner: boolean) => {
+    const attachSocket = (socket: any, amOwner: boolean) => {
       socketRef.current = socket;
       setStatus('Connected ✅');
 
-      let keyHex = await getKey(contact);
-      if (amOwner && !keyHex) {
-        keyHex = CryptoJS.lib.WordArray.random(32).toString(CryptoJS.enc.Hex);
-        await saveKey(contact, keyHex);
-      }
-      keyRef.current = keyHex;
-
-      socket.write(JSON.stringify({type: 'hello', from: myUsername, key: amOwner ? keyHex : undefined}) + '\n');
-      if (keyRef.current) flushQueue();
-
+      // Listen immediately — before any async work — so we never miss
+      // a fast-arriving hello packet from the other side.
       socket.on('data', async (data: any) => {
         try {
           const parsed: any = JSON.parse(data.toString().trim());
@@ -524,8 +516,19 @@ function ChatScreen({
         setStatus('Disconnected');
       });
       socket.on('close', () => setStatus('Disconnected'));
-    };
 
+      // Now do the key setup and send our own hello — this can safely take a moment.
+      (async () => {
+        let keyHex = await getKey(contact);
+        if (amOwner && !keyHex) {
+          keyHex = CryptoJS.lib.WordArray.random(32).toString(CryptoJS.enc.Hex);
+          await saveKey(contact, keyHex);
+        }
+        keyRef.current = keyHex;
+        socket.write(JSON.stringify({type: 'hello', from: myUsername, key: amOwner ? keyHex : undefined}) + '\n');
+        if (keyRef.current) flushQueue();
+      })();
+    };
     const openAsServer = () => {
       if (serverRef.current) return;
       const server = TcpSocket.createServer((socket: any) => attachSocket(socket, true));
@@ -561,16 +564,18 @@ function ChatScreen({
       return false;
     };
 
-    const trySilentConnect = async (deviceAddress: string) => {
+    const trySilentConnect = async (deviceAddress: string): Promise<boolean> => {
       try {
         await connectWithConfig({deviceAddress, groupOwnerIntent: 0});
         for (let i = 0; i < 15 && !cancelled; i++) {
           await new Promise(r => setTimeout(r, 1000));
           const connected = await checkAlreadyConnected();
-          if (connected) return;
+          if (connected) return true;
         }
+        return false;
       } catch (e) {
         console.log('Silent connect error:', e);
+        return false;
       }
     };
 
@@ -583,15 +588,22 @@ function ChatScreen({
         await startDiscoveringPeers();
       } catch (e) {}
 
+      let connecting = false;
       pollTimer = setInterval(async () => {
-        if (cancelled) return;
+        if (cancelled || connecting) return;
         try {
           const result = await getAvailablePeers();
           const match = result.devices?.find((d: any) => d.deviceName === contact);
           if (match) {
-            clearInterval(pollTimer);
+            connecting = true;
             setStatus(`Connecting to ${contact}...`);
-            await trySilentConnect(match.deviceAddress);
+            const success = await trySilentConnect(match.deviceAddress);
+            connecting = false;
+            if (success) {
+              clearInterval(pollTimer);
+            } else {
+              setStatus(`Looking for ${contact}...`);
+            }
           }
         } catch (e) {}
       }, 3000);
@@ -628,6 +640,7 @@ function ChatScreen({
           visitedNodes: ['my-device'],
           timestamp: Date.now(),
         };
+        console.log('WIRE PAYLOAD:', packet.text);
         socketRef.current.write(JSON.stringify(packet) + '\n');
         addMessage(text, true, 'sent');
       } catch (e) {
