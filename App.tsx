@@ -491,10 +491,25 @@ function NetworkMapScreen() {
 export default function App() {
   const [screen, setScreen] = useState('loading');
   const [selectedContact, setSelectedContact] = useState('');
-  const [peerIP, setPeerIP] = useState('');
-  const [isServer, setIsServer] = useState(false);
   const [username, setUsername] = useState('');
   const [chatOrigin, setChatOrigin] = useState<'contacts' | 'chatslist'>('contacts');
+  const [connStatusMap, setConnStatusMap] = useState<Record<string, string>>({});
+  const [incomingSignal, setIncomingSignal] = useState<{contact: string; nonce: number} | null>(null);
+
+  const socketRef = useRef<any>(null);
+  const serverRef = useRef<any>(null);
+  const keyRef = useRef<string | null>(null);
+  const activePeerRef = useRef<string | null>(null);
+  const screenRef = useRef(screen);
+  const selectedContactRef = useRef(selectedContact);
+  const usernameRef = useRef(username);
+  const cancelledRef = useRef(false);
+  const pollTimerRef = useRef<any>(null);
+  const discoverTimerRef = useRef<any>(null);
+
+  useEffect(() => { screenRef.current = screen; }, [screen]);
+  useEffect(() => { selectedContactRef.current = selectedContact; }, [selectedContact]);
+  useEffect(() => { usernameRef.current = username; }, [username]);
 
   useEffect(() => {
     AsyncStorage.getItem('username').then(name => {
@@ -505,16 +520,215 @@ export default function App() {
         setScreen('setup');
       }
     });
-    // Turn on WiFi Direct once, up front — so ChatScreen can silently
-    // connect no matter which screen you open first.
-    (async () => {
+  }, []);
+
+  const setStatus = (contact: string, status: string) => {
+    setConnStatusMap(prev => ({...prev, [contact]: status}));
+  };
+
+  const deliverIncoming = async (contact: string, text: string) => {
+    const storageKey = `chat_${contact}`;
+    const saved = await AsyncStorage.getItem(storageKey);
+    const messages = saved ? JSON.parse(saved) : [];
+    messages.push({id: Date.now().toString() + Math.random().toString(36).slice(2), text, mine: false, time: getTimeNow(), status: 'sent'});
+    await AsyncStorage.setItem(storageKey, JSON.stringify(messages));
+    setIncomingSignal({contact, nonce: Date.now()});
+  };
+
+  const flushQueueFor = async (contact: string) => {
+    if (!socketRef.current || !keyRef.current || activePeerRef.current !== contact) return;
+    const storageKey = `chat_${contact}`;
+    const saved = await AsyncStorage.getItem(storageKey);
+    const messages = saved ? JSON.parse(saved) : [];
+    let changed = false;
+    for (const m of messages) {
+      if (m.mine && m.status === 'pending') {
+        try {
+          const packet: Packet = {
+            messageId: m.id,
+            senderId: 'my-device',
+            recipientId: contact,
+            text: encryptText(m.text, keyRef.current),
+            ttl: 20,
+            visitedNodes: ['my-device'],
+            timestamp: Date.now(),
+          };
+          socketRef.current.write(JSON.stringify(packet) + '\n');
+          m.status = 'sent';
+          changed = true;
+        } catch (e) {}
+      }
+    }
+    if (changed) {
+      await AsyncStorage.setItem(storageKey, JSON.stringify(messages));
+      setIncomingSignal({contact, nonce: Date.now()});
+    }
+  };
+
+  const sendToContact = async (contact: string, text: string) => {
+    const storageKey = `chat_${contact}`;
+    const saved = await AsyncStorage.getItem(storageKey);
+    const messages = saved ? JSON.parse(saved) : [];
+    messages.push({id: Date.now().toString(), text, mine: true, time: getTimeNow(), status: 'pending'});
+    await AsyncStorage.setItem(storageKey, JSON.stringify(messages));
+    setIncomingSignal({contact, nonce: Date.now()});
+    flushQueueFor(contact);
+  };
+
+  const sendMyHello = async (socket: any, amOwner: boolean, contact: string | null) => {
+    let keyHex: string | null = null;
+    if (contact) keyHex = await getKey(contact);
+    if (amOwner && contact && !keyHex) {
+      keyHex = CryptoJS.lib.WordArray.random(32).toString(CryptoJS.enc.Hex);
+      await saveKey(contact, keyHex);
+    }
+    if (contact) keyRef.current = keyHex;
+    try {
+      socket.write(JSON.stringify({type: 'hello', from: usernameRef.current, key: amOwner ? keyHex : undefined}) + '\n');
+    } catch (e) {}
+  };
+
+  const bindSocket = (socket: any, amOwner: boolean, knownContact: string | null) => {
+    socketRef.current = socket;
+    let contact = knownContact;
+
+    if (contact) {
+      activePeerRef.current = contact;
+      setStatus(contact, 'Connected ✅');
+      sendMyHello(socket, amOwner, contact);
+    }
+
+    socket.on('data', async (data: any) => {
+      try {
+        const parsed: any = JSON.parse(data.toString().trim());
+        if (parsed.type === 'hello') {
+          if (!contact) {
+            contact = await findDeviceNameForUsername(parsed.from);
+            activePeerRef.current = contact;
+            await saveContact(contact);
+            setStatus(contact, 'Connected ✅');
+            await sendMyHello(socket, amOwner, contact);
+          }
+          await saveUsername(contact, parsed.from);
+          if (parsed.key) {
+            keyRef.current = parsed.key;
+            await saveKey(contact, parsed.key);
+          }
+          if (keyRef.current) await flushQueueFor(contact);
+          return;
+        }
+        if (parsed.text && contact) {
+          const plain = keyRef.current ? decryptText(parsed.text, keyRef.current) : parsed.text;
+          await deliverIncoming(contact, plain);
+        }
+      } catch {
+        if (contact) await deliverIncoming(contact, data.toString().trim());
+      }
+    });
+
+    socket.on('error', () => {
+      if (contact) setStatus(contact, 'Disconnected');
+    });
+    socket.on('close', () => {
+      if (contact) setStatus(contact, 'Disconnected');
+      if (activePeerRef.current === contact) activePeerRef.current = null;
+      socketRef.current = null;
+      keyRef.current = null;
+    });
+  };
+
+  const openAsServer = () => {
+    if (serverRef.current) return;
+    const server = TcpSocket.createServer((socket: any) => bindSocket(socket, true, null));
+    server.listen({port: 8888, host: '0.0.0.0'});
+    serverRef.current = server;
+  };
+
+  const openAsClient = (ip: string, contact: string | null) => {
+    if (socketRef.current) return;
+    let attempts = 0;
+    const tryConnect = () => {
+      if (cancelledRef.current) return;
+      attempts++;
+      const socket = TcpSocket.createConnection(
+        {port: 8888, host: ip, timeout: 5000},
+        () => bindSocket(socket, false, contact),
+      );
+      socket.on('error', () => {
+        if (!cancelledRef.current && attempts < 5) setTimeout(tryConnect, 2000);
+      });
+    };
+    tryConnect();
+  };
+
+  const checkAlreadyConnected = async (contactHint: string | null) => {
+    try {
+      const info = await getConnectionInfo();
+      if (info?.groupOwnerAddress?.hostAddress) {
+        if (info.isGroupOwner) openAsServer();
+        else openAsClient(info.groupOwnerAddress.hostAddress, contactHint);
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  };
+
+  useEffect(() => {
+    cancelledRef.current = false;
+
+    const searchLoop = async () => {
+      await checkAlreadyConnected(null);
+      try {
+        await startDiscoveringPeers();
+      } catch (e) {}
+
+      pollTimerRef.current = setInterval(async () => {
+        if (cancelledRef.current || socketRef.current) return;
+        if (screenRef.current !== 'chat' || !selectedContactRef.current) return;
+        const target = selectedContactRef.current;
+        try {
+          const result = await getAvailablePeers();
+          const match = result.devices?.find((d: any) => d.deviceName === target);
+          if (match) {
+            setStatus(target, `Connecting to ${target}...`);
+            try {
+              await connectWithConfig({deviceAddress: match.deviceAddress, groupOwnerIntent: 0});
+              for (let i = 0; i < 15 && !cancelledRef.current; i++) {
+                await new Promise(r => setTimeout(r, 1000));
+                const ok = await checkAlreadyConnected(target);
+                if (ok) break;
+              }
+            } catch (e) {}
+            if (!socketRef.current) setStatus(target, `Looking for ${target}...`);
+          }
+        } catch (e) {}
+      }, 3000);
+
+      discoverTimerRef.current = setInterval(() => {
+        startDiscoveringPeers().catch(() => {});
+      }, 10000);
+    };
+
+    const start = async () => {
       try {
         const granted = await requestPermissions();
-        if (granted) await initialize();
+        if (!granted) return;
+        await initialize();
       } catch (e) {
         console.log('Root WiFi init error:', e);
+        return;
       }
-    })();
+      openAsServer();
+      await searchLoop();
+    };
+
+    start();
+
+    return () => {
+      cancelledRef.current = true;
+      clearInterval(pollTimerRef.current);
+      clearInterval(discoverTimerRef.current);
+    };
   }, []);
 
   const goBack = () => {
@@ -551,8 +765,6 @@ export default function App() {
         <ChatsListScreen
           onChat={name => {
             setSelectedContact(name);
-            setPeerIP('');
-            setIsServer(false);
             setChatOrigin('chatslist');
             setScreen('chat');
           }}
@@ -561,17 +773,21 @@ export default function App() {
       {screen === 'contacts' && (
         <ContactsScreen
           username={username}
-          onChat={(name, ip, server) => {
+          onChat={name => {
             setSelectedContact(name);
-            setPeerIP(ip);
-            setIsServer(server);
             setChatOrigin('contacts');
             setScreen('chat');
           }}
         />
       )}
       {screen === 'chat' && (
-        <ChatScreen contact={selectedContact} peerIP={peerIP} isServer={isServer} myUsername={username} />
+        <ChatScreen
+          contact={selectedContact}
+          myUsername={username}
+          status={connStatusMap[selectedContact] || `Looking for ${selectedContact}...`}
+          incomingSignal={incomingSignal}
+          onSend={sendToContact}
+        />
       )}
       {screen === 'map' && <NetworkMapScreen />}
     </View>
